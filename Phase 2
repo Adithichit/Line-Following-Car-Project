@@ -1,0 +1,142 @@
+%% Phase 2: LIMO OBSTACLE AVOIDANCE
+% Summary:
+%   - Scan bottom region of the image
+%   - If a dark object occupies > threshold area → STOP or TURN
+%   - Else → drive forward normally
+%
+% Controller Parameters 
+v_nominal = 0.20;          % forward speed [m/s]
+turn_gain  = 0.4;          % steering proportional gain
+steer_max  = 0.6;          % radians
+roi_height = 80;           % region height (for ≈2 ft distance)
+obstacle_threshold = 0.25; % fraction of dark pixels to trigger obstacle
+turn_speed = 0.10;         % slow speed while turning
+turn_angle = 0.35;         % radians
+pause_time = 0.3;          % delay between commands
+numSteps   = 20;           % number of control iterations
+max_avoid_tries = 2;       % stop after this many failed attempts
+avoid_attempts = 0;        % counter for failed evasions
+recovery_steps = 8;        % steps to allow turning before rechecking
+
+% Camera Initialization
+cam = webcam;
+disp('🎥 Camera initialized.');
+cam = ipcam('http://192.168.1.175:8000/video_stream');
+figure;
+while true
+  frame = snapshot(cam);
+  hsv = rgb2hsv(frame);
+  % Blue mask
+  blueMask = hsv(:,:,1) > 0.55 & hsv(:,:,1) < 0.75 & ...
+             hsv(:,:,2) > 0.4  & ...
+             hsv(:,:,3) > 0.2;
+  blueMask = bwareaopen(blueMask, 300);
+  blueMask = imfill(blueMask, 'holes');
+  % Find biggest blob
+  stats = regionprops(blueMask, 'Centroid', 'Area');
+  frameCenterX = size(frame,2) / 2;  % center of image
+  if ~isempty(stats)
+      [~, idx] = max([stats.Area]);
+      centroid = stats(idx).Centroid;
+      lineX = centroid(1);
+      % Compute steering error
+      error = lineX - frameCenterX;
+      % Normalize error for control later
+      errorNorm = error / frameCenterX; % gives range -1 to +1
+      % Show tracking
+      imshow(frame); hold on;
+      plot(lineX, centroid(2), 'r*', 'MarkerSize', 15);
+      xline(frameCenterX, '--g', 'Center');
+      text(20, 30, sprintf("Error = %.2f", errorNorm), 'Color','yellow','FontSize',14);
+      hold off;
+  else
+      imshow(frame);
+      text(20, 30, "No line detected", 'Color','red','FontSize',16);
+      errorNorm = 0;
+  end
+  drawnow;
+end
+% Main Control Loop
+for k = 1:numSteps
+   frame = snapshot(cam);
+   hsv = rgb2hsv(frame);
+   [H,W,~] = size(frame); frameCenterX = W/2;
+
+   % Line detection (blue)
+   blueMask = hsv(:,:,1) > 0.55 & hsv(:,:,1) < 0.75 & ...
+              hsv(:,:,2) > 0.4  & hsv(:,:,3) > 0.2;
+   blueMask = bwareaopen(blueMask,300); blueMask = imfill(blueMask,'holes');
+   stats = regionprops(blueMask,'Centroid','Area');
+
+   % Improved obstacle detection (~2 ft ROI)
+   gray = rgb2gray(frame);
+   roi_top = H - roi_height; roi = gray(roi_top:H,:);
+
+   % Edge density and brightness variance
+   edges = edge(roi,'Canny');
+   edgeDensity = sum(edges(:)) / numel(edges);
+   brightnessStd = std(double(roi(:))) / 255;  % normalized contrast measure
+
+   % Combine into a composite score (high edge density + brightness change = obstacle)
+   obs_score = 0.6*edgeDensity + 0.4*brightnessStd;
+   obstacleDetected = obs_score > obstacle_threshold;
+   % Control logic
+   if obstacleDetected
+       left_edges  = sum(sum(edges(:,1:W/2)));
+       right_edges = sum(sum(edges(:,W/2:end)));
+       if left_edges > right_edges
+           steer_cmd =  turn_angle;
+       else
+           steer_cmd = -turn_angle;
+       end
+       v_cmd = turn_speed;
+       avoid_attempts = avoid_attempts + 1;
+       mode = sprintf("Avoiding obstacle (try %d)", avoid_attempts);
+       if avoid_attempts > max_avoid_tries
+           disp('🛑 Too many failed avoidance attempts. Stopping.');
+           fwrite(tcpipClient, sprintf('%f,%f', 0, 0));
+           break;
+       end
+
+       % Turn maneuver for several steps
+       for t = 1:recovery_steps
+           fwrite(tcpipClient, sprintf('%f,%f', v_cmd, steer_cmd));
+           pause(pause_time);
+       end
+       continue;
+   else
+       avoid_attempts = 0; % reset if clear
+   end
+
+   % Normal blue line following
+   if ~isempty(stats)
+       [~,idx] = max([stats.Area]);
+       centroid = stats(idx).Centroid;
+       lineX = centroid(1);
+       error = lineX - frameCenterX;
+       errorNorm = error / frameCenterX;
+       steer_cmd = -turn_gain * errorNorm;
+       steer_cmd = max(-steer_max, min(steer_cmd, steer_max));
+       v_cmd = v_nominal;
+       mode = sprintf("Line tracking (err=%.2f)", errorNorm);
+   else
+       steer_cmd = 0; v_cmd = 0;
+       mode = "No line detected";
+   end
+   % Send command
+   fwrite(tcpipClient, sprintf('%f,%f', v_cmd, steer_cmd));
+
+   % Visualization
+   imshow(frame); hold on;
+   rectangle('Position',[1,H - roi_height,W,roi_height],'EdgeColor','y','LineWidth',2);
+   text(25,40,mode,'Color','w','FontSize',12);
+   if obstacleDetected
+       text(25,70,'⚠️ OBSTACLE CLOSE','Color','r','FontSize',14,'FontWeight','bold');
+   end
+   hold off;
+   title(sprintf('Step %d/%d | v=%.2f | steer=%.2f | obsScore=%.2f', ...
+         k, numSteps, v_cmd, steer_cmd, obs_score));
+   fprintf('Step %02d/%02d | %s | v=%.2f | steer=%.2f | obsScore=%.2f\n', ...
+       k, numSteps, mode, v_cmd, steer_cmd, obs_score);
+   pause(pause_time);
+end
