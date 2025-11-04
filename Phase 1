@@ -1,0 +1,45 @@
+% Define the server address and port
+limoAddress = '192.168.1.175';  % Set this to the Limo's IP address
+limoPort = 12345;  % Do not change
+% Create a TCP/IP client
+tcpipClient = tcpip(limoAddress, limoPort, 'NetworkRole', 'client');
+% Open the connection
+fopen(tcpipClient);
+%% Lab Test Commands
+linearVelocity = 0.1;
+steeringAngle = 0;
+for i=1:10
+  % Send the command to the server
+  command = sprintf('%f,%f', linearVelocity, steeringAngle);
+  fwrite(tcpipClient, command);
+  % Always wait 0.3 seconds between commands
+  pause(.3)
+end
+%% Phase 1 Commands
+% Test Movement
+linVelocity_fwd = 0.3;
+steerAngle_fwd = 0.3;
+linVelocity_bwd = 0.2;
+steerAngle_bwd = -0.3;
+% for each movement command, create a new for loop listing the command.
+% set the loop to the amount of time you would like the robot to move
+% according to that command.
+for i=1:10
+  % Send the command to the server
+  command_fwd = sprintf('%f,%f', linVelocity_fwd, steerAngle_fwd);
+  fwrite(tcpipClient, command_fwd);
+  % Always wait 0.3 seconds between commands
+  pause(.3)
+end
+for i=1:10
+  % Send the command to the server
+  command_bwd = sprintf('%f,%f', linVelocity_bwd, steerAngle_bwd);
+  fwrite(tcpipClient, command_bwd);
+  pause(0.3)
+end
+%%
+% Close the connection
+fclose(tcpipClient);
+delete(tcpipClient);
+clear tcpipClient;
+
