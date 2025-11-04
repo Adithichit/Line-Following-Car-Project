@@ -1,0 +1,109 @@
+%% Parameters
+v_nominal    = 0.15;
+steer_max    = 0.7;
+roi_ratio    = 0.60;    % << increased from 0.50 to give taller yellow ROI box
+pause_time   = 0.08;
+numSteps     = 1000;
+Kp = 0.9;
+Kd = 0.25;
+alpha_smooth = 0.6;
+centroid_buffer_len = 5;
+centroid_buf = nan(centroid_buffer_len,1);
+centroid_idx = 0;
+prev_error = 0;
+steer_prev = 0;
+line_lost_frames = 0;
+max_lost_frames = 5;
+figure('Name','Blue Line Follow','NumberTitle','off');
+% Main Loop
+for k = 1:numSteps
+  
+   frame = snapshot(cam);
+   [H,W,~] = size(frame);
+   frameCenterX = W/2;
+  
+   roi_height = round(roi_ratio * H);            % bottom ROI pixel height
+   roi_top_line = H - roi_height;                % start point
+  
+   roi_line = frame(roi_top_line:H,:,:);
+  
+   hsv = rgb2hsv(roi_line);
+   Hc = hsv(:,:,1); Sc = hsv(:,:,2); Vc = hsv(:,:,3);
+  
+   % Blue mask
+   blueMask = (Hc>0.55 & Hc<0.72) & (Sc>0.4) & (Vc>0.25 & Vc<0.85);
+  
+   % Remove green (intersections)
+   greenMask = (Hc>0.25 & Hc<0.45) & (Sc>0.4) & (Vc>0.2 & Vc<0.85);
+   blueMask(greenMask) = 0;
+  
+   blueMask = bwareaopen(blueMask, 50);
+   blueMask = imclose(blueMask, strel('rectangle',[15 25]));
+   blueMask = imfill(blueMask,'holes');
+  
+   stats = regionprops(blueMask,'Centroid','Area','BoundingBox');
+   lineDetected = false;
+  
+   if ~isempty(stats)
+       [~,idx] = max([stats.Area]);
+       centroid = stats(idx).Centroid;
+       bbox = stats(idx).BoundingBox;
+      
+       if stats(idx).Area > 50 && (bbox(3)/bbox(4))>0.1 && centroid(2)>0.6*size(blueMask,1)
+           lineDetected = true;
+           centroid_idx = mod(centroid_idx, centroid_buffer_len)+1;
+           centroid_buf(centroid_idx) = centroid(1);
+           lineX = 0.7*mean(centroid_buf,'omitnan') + 0.3*centroid(1);
+           line_lost_frames = 0;
+       end
+   end
+  
+   % Line following control
+   if lineDetected
+       errorNorm = (lineX-frameCenterX)/frameCenterX;
+       d_err = (errorNorm-prev_error)/max(pause_time,1e-6);
+      
+       steer_unclamped = -(Kp*errorNorm + Kd*d_err);
+       steer_unclamped = max(-steer_max,min(steer_unclamped,steer_max));
+      
+       if abs(errorNorm)>0.40, v_cmd=0.09;
+       elseif abs(errorNorm)>0.20, v_cmd=0.12;
+       else, v_cmd=v_nominal;
+       end
+      
+       steer_cmd = alpha_smooth*steer_prev + (1-alpha_smooth)*steer_unclamped;
+       steer_prev = steer_cmd;
+       prev_error = errorNorm;
+       mode = sprintf("Tracking (err=%.2f)",errorNorm);
+      
+   else
+       line_lost_frames = line_lost_frames + 1;
+       if line_lost_frames <= max_lost_frames
+           steer_cmd = steer_prev;
+           v_cmd = v_nominal*0.8;
+           mode = "Line lost — holding steer";
+       else
+           v_cmd = 0.08;
+           if prev_error>0, steer_cmd=-0.45;
+           elseif prev_error<0, steer_cmd=0.45;
+           elseif mod(k,20)<10, steer_cmd=0.45;
+           else, steer_cmd=-0.45; end
+           mode = "Searching...";
+       end
+   end
+  
+   % Send to robot
+   write(client,sprintf('%f,%f',v_cmd,steer_cmd),"char");
+  
+   % Visualization
+   imshow(frame); hold on;
+   xline(frameCenterX,'--g');
+   rectangle('Position',[1,H-roi_height,W,roi_height],'EdgeColor','y','LineWidth',2);
+   if lineDetected
+       plot(lineX,centroid(2)+roi_top_line,'r*','MarkerSize',12);
+   end
+   text(20,30,mode,'Color','w','FontSize',12,'FontWeight','bold');
+   hold off; drawnow;
+  
+   pause(pause_time);
+end
